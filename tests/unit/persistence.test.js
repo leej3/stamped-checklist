@@ -146,4 +146,47 @@ describe("answer identity after adding M.4", () => {
         script.confirmReset();
         expect(JSON.parse(localStorage.getItem("stamped_checklist"))).toEqual({ format: 2, responses: {} });
     });
+    it("explicit Save writes permanent question IDs and reloads the answer", async () => {
+        const script = await build(withM4());
+        const domId = domIdFor(withM4(), stableId);
+        script.handleResponse(domId, "no");
+        script.handleReason(domId, answer.reason);
+        localStorage.clear();
+        script.saveToLocalStorage();
+        expect(JSON.parse(localStorage.getItem("stamped_checklist"))).toEqual({
+            format: 2,
+            responses: { [stableId]: answer },
+        });
+        await build(withM4());
+        expectRestored(withM4());
+    });
+    for (const [name, payload] of [
+        ["unsupported format", { format: 99, responses: { [stableId]: answer } }],
+        ["invalid responses", { responses: null }],
+        ["invalid answer", { responses: { s1_p3_i0: { value: "maybe", reason: "" } } }],
+    ]) {
+        it(`preserves browser data with ${name} when Save is requested`, async () => {
+            vi.spyOn(console, "warn").mockImplementation(() => {});
+            const original = JSON.stringify(payload);
+            localStorage.setItem("stamped_checklist", original);
+            const script = await build(withM4());
+            expect(document.querySelectorAll(".response-btn.active").length).toBe(0);
+            expect(document.getElementById("toast").textContent).toContain("could not be restored");
+            script.saveToLocalStorage();
+            expect(localStorage.getItem("stamped_checklist")).toBe(original);
+        });
+    }
+    for (const url of ["/?format=2", `/?state=${btoa("1")}`]) {
+        it(`preserves an unreadable link and browser save: ${url}`, async () => {
+            vi.spyOn(console, "warn").mockImplementation(() => {});
+            const original = JSON.stringify({ responses: { s1_p3_i0: answer } });
+            localStorage.setItem("stamped_checklist", original);
+            const script = await build(withM4(), url);
+            expect(document.querySelectorAll(".response-btn.active").length).toBe(0);
+            expect(document.getElementById("toast").textContent).toContain("could not be restored");
+            script.handleResponse("s0_p0_i0", "yes");
+            expect(window.location.search).toBe(url.slice(1));
+            expect(localStorage.getItem("stamped_checklist")).toBe(original);
+        });
+    }
 });
