@@ -38,6 +38,7 @@ const DATA = checklist.data.map((group) => ({
             name: principleName,
             desc: linkedPrinciples.map((principle) => principle.statement).join(" "),
             items: entry.items.map((item) => item.text),
+            itemIds: entry.items.map((item) => item.id),
         };
     }),
 }));

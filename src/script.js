@@ -1,7 +1,10 @@
 import { VERSION, DATA } from "./checklist.js";
+import { PERSISTENCE_FORMAT, readResponses, readLegacyState } from "./persistence.js";
 
 let responseStates = {};
 let totalItems = 0;
+let stableIds = new Map();
+let persistenceBlocked = false;
 const THEME_KEY = "stamped_theme";
 const VALID_COLUMN_VALUES = new Set(["1", "2", "auto"]);
 const VALID_SECTION_VALUES = new Set(["on", "off"]);
@@ -50,20 +53,27 @@ function renderInlineMarkdown(text) {
         .join("");
 }
 
-function getEncodedStateBits() {
-    // Encode each checklist item to one bit in DATA traversal order:
-    // sections -> principles -> items, where getState() true => 1 and false => 0.
-    const state = getState();
-    const bits = [];
-    DATA.forEach((section, si) => {
-        section.principles.forEach((principle, pi) => {
-            principle.items.forEach((_, ii) => {
-                const id = generateId(si, pi, ii);
-                bits.push(state[id] ? "1" : "0");
-            });
-        });
-    });
-    return btoa(bits.join(""));
+function savedResponses() {
+    return Object.fromEntries(
+        [...stableIds].flatMap(([domId, stableId]) => {
+            const response = responseStates[domId];
+            return response.value !== null || response.reason ? [[stableId, response]] : [];
+        })
+    );
+}
+
+function restoreResponses(responses) {
+    for (const [domId, stableId] of stableIds) {
+        responseStates[domId] = responses[stableId] || { value: null, reason: "" };
+        applyResponseState(domId);
+    }
+    updateAllCounts();
+}
+
+function reportPersistenceError(error) {
+    persistenceBlocked = true;
+    console.warn("Could not restore saved checklist answers", error);
+    showToast("Saved answers could not be restored. Original data kept; reset to start a new assessment.");
 }
 
 function getSelectedOrDefaultView(name, validValues, fallback) {
@@ -75,21 +85,16 @@ function getSelectedOrDefaultView(name, validValues, fallback) {
 }
 
 function syncPersistentURL() {
+    if (persistenceBlocked) return;
     const params = new URLSearchParams();
 
     params.set("cols", getSelectedOrDefaultView("cols", VALID_COLUMN_VALUES, "auto"));
     params.set("sections", getSelectedOrDefaultView("sections", VALID_SECTION_VALUES, "off"));
-    params.set("state", getEncodedStateBits());
-
-    const nonEmptyResponses = {};
-    Object.entries(responseStates).forEach(([id, rs]) => {
-        if (rs.value !== null || rs.reason) {
-            nonEmptyResponses[id] = rs;
-        }
-    });
-    if (Object.keys(nonEmptyResponses).length > 0) {
-        params.set("responses", btoa(JSON.stringify(nonEmptyResponses)));
-    }
+    params.set("format", String(PERSISTENCE_FORMAT));
+    // Always include responses, even when empty, so a shared blank assessment
+    // does not inherit unrelated answers from the recipient's browser.
+    const bytes = new TextEncoder().encode(JSON.stringify(savedResponses()));
+    params.set("responses", btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join("")));
 
     window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
 }
@@ -202,6 +207,10 @@ function getPrincipleExamplesURL(principle) {
 }
 
 function buildChecklist() {
+    responseStates = {};
+    stableIds = new Map();
+    totalItems = 0;
+    persistenceBlocked = false;
     const container = document.getElementById("app");
 
     const cardsGrid = document.createElement("div");
@@ -260,6 +269,7 @@ function buildChecklist() {
 
             principle.items.forEach((item, ii) => {
                 const id = generateId(si, pi, ii);
+                stableIds.set(id, principle.itemIds[ii]);
                 const itemText = renderInlineMarkdown(item);
                 totalItems++;
                 responseStates[id] = { value: null, reason: "" };
@@ -293,11 +303,12 @@ function buildChecklist() {
     // when applyResponseState calls autoResizeTextarea (display:none parent yields
     // scrollHeight=0, which would collapse all reason textareas on load).
     loadModePreference();
-    loadFromURL();
-    // URL state is authoritative when present; localStorage only hydrates when URL has no encoded state.
-    if (!new URLSearchParams(window.location.search).has("state")) {
+    // Check before loadFromURL canonicalizes the URL, including view-only links.
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("state") && !params.has("responses") && !params.has("format")) {
         loadFromLocalStorage();
     }
+    loadFromURL();
     updateAllCounts();
     loadColumnPreference();
     loadSectionsPreference();
@@ -527,7 +538,11 @@ function setState(state) {
 
 // Local Storage
 function saveToLocalStorage() {
-    localStorage.setItem("stamped_checklist", JSON.stringify({ responses: responseStates }));
+    if (persistenceBlocked) return;
+    localStorage.setItem(
+        "stamped_checklist",
+        JSON.stringify({ format: PERSISTENCE_FORMAT, responses: savedResponses() })
+    );
     showToast("💾 Progress saved to browser");
 }
 
@@ -537,20 +552,21 @@ function loadFromLocalStorage() {
         try {
             const parsed = JSON.parse(data);
             if (parsed && parsed.responses !== undefined) {
-                Object.keys(parsed.responses || {}).forEach((id) => {
-                    if (id in responseStates) {
-                        responseStates[id] = parsed.responses[id];
-                        applyResponseState(id);
-                    }
-                });
+                restoreResponses(readResponses(parsed.responses, parsed.format));
             }
             updateAllCounts();
-        } catch (e) {}
+        } catch (e) {
+            reportPersistenceError(e);
+        }
     }
 }
 
 function autoSave() {
-    localStorage.setItem("stamped_checklist", JSON.stringify({ responses: responseStates }));
+    if (persistenceBlocked) return;
+    localStorage.setItem(
+        "stamped_checklist",
+        JSON.stringify({ format: PERSISTENCE_FORMAT, responses: savedResponses() })
+    );
     syncPersistentURL();
 }
 
@@ -568,40 +584,29 @@ function loadFromURL() {
     const validColsParam = colsParam && VALID_COLUMN_VALUES.has(colsParam) ? colsParam : null;
     const validSectionsParam = sectionsParam && VALID_SECTION_VALUES.has(sectionsParam) ? sectionsParam : null;
 
-    if (!stateParam && !responsesParam && !colsParam && !sectionsParam) return;
+    if (!params.has("state") && !params.has("responses") && !params.has("format") && !colsParam && !sectionsParam)
+        return;
 
-    if (stateParam) {
+    if (params.has("state") || params.has("responses") || params.has("format")) {
         try {
-            const bits = atob(decodeURIComponent(stateParam)).split("");
-            let idx = 0;
-            const state = {};
-            DATA.forEach((section, si) => {
-                section.principles.forEach((principle, pi) => {
-                    principle.items.forEach((_, ii) => {
-                        const id = generateId(si, pi, ii);
-                        state[id] = bits[idx] === "1";
-                        idx++;
-                    });
-                });
-            });
-            setState(state);
+            const format = params.has("format") ? Number(params.get("format")) : undefined;
+            let responses = {};
+            if (format === undefined && stateParam !== null) {
+                responses = readLegacyState(atob(stateParam));
+            }
+            if (responsesParam !== null) {
+                const binary = atob(responsesParam);
+                const json =
+                    format === PERSISTENCE_FORMAT
+                        ? new TextDecoder().decode(Uint8Array.from(binary, (char) => char.charCodeAt(0)))
+                        : binary;
+                responses = { ...responses, ...readResponses(JSON.parse(json), format) };
+            } else if (format !== undefined) {
+                throw new Error("Missing responses for saved-answer format");
+            }
+            restoreResponses(responses);
         } catch (e) {
-            console.warn("Could not load state from URL", e);
-        }
-    }
-
-    if (responsesParam) {
-        try {
-            const decoded = JSON.parse(atob(decodeURIComponent(responsesParam)));
-            Object.keys(decoded).forEach((id) => {
-                if (id in responseStates) {
-                    responseStates[id] = decoded[id];
-                    applyResponseState(id);
-                }
-            });
-            updateAllCounts();
-        } catch (e) {
-            console.warn("Could not load responses from URL", e);
+            reportPersistenceError(e);
         }
     }
 
@@ -621,6 +626,7 @@ function loadFromURL() {
 // Reset
 function confirmReset() {
     if (confirm("Are you sure you want to reset all responses? This cannot be undone.")) {
+        persistenceBlocked = false;
         Object.keys(responseStates).forEach((id) => {
             responseStates[id] = { value: null, reason: "" };
             applyResponseState(id);

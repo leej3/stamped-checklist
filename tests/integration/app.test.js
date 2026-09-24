@@ -449,3 +449,31 @@ test.describe("STAMPED Checklist App", () => {
         await context.close();
     });
 });
+
+// Real-browser smoke test for the one supported pre-M.4 migration.
+test("legacy response links become stable-ID links and browser saves", async ({ browser }) => {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const legacy = Buffer.from(
+        JSON.stringify({ s1_p3_i0: { value: "no", reason: "Needs a fresh environment" } })
+    ).toString("base64");
+    await page.goto(`/?responses=${encodeURIComponent(legacy)}`);
+    const item = page.locator(".check-item").filter({ hasText: "Is the pipeline tested in a fresh container" });
+    await expect(item.locator(".no-btn")).toHaveClass(/active/);
+    await expect(item.locator(".reason-input")).toHaveValue("Needs a fresh environment");
+    await item.locator(".reason-input").fill("Rebuild required — café 🔬");
+    const sharedURL = await page.evaluate(() => window.location.href);
+    expect(new URL(sharedURL).searchParams.get("format")).toBe("2");
+    expect(new URL(sharedURL).searchParams.has("state")).toBe(false);
+    const saved = await page.evaluate(() => JSON.parse(localStorage.getItem("stamped_checklist")));
+    expect(saved.responses["stamped-checklist:should/004"]).toEqual({
+        value: "no",
+        reason: "Rebuild required — café 🔬",
+    });
+    await page.goto("/");
+    await expect(item.locator(".reason-input")).toHaveValue("Rebuild required — café 🔬");
+    await page.evaluate(() => localStorage.clear());
+    await page.goto(sharedURL);
+    await expect(item.locator(".reason-input")).toHaveValue("Rebuild required — café 🔬");
+    await context.close();
+});
